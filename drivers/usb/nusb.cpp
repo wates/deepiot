@@ -1,5 +1,5 @@
 // win_usb.cpp
-#include "iusb.h"
+#include "nusb.h"
 
 #include <tchar.h>
 #include <strsafe.h>
@@ -50,17 +50,21 @@ private:
   std::condition_variable cv_;
 };
 
-class Iusb :
+class NakedUsbImpl :
   public NakedUsb
 {
 public:
-  Iusb();
-  ~Iusb();
+  NakedUsbImpl();
+  ~NakedUsbImpl();
   bool Open(LPGUID interface_guid);
   void Close();
   inline const std::vector<Endpoint>& Endpoints()const{ return ends_; }
   bool onEasyRead(std::function<void(uint8_t *buf, size_t len)> cb);
   void Poll();
+  int ReadSync(const Endpoint *ep, uint8_t *buf, int len);
+  void WriteSync(const Endpoint *ep, const uint8_t *buf, int len);
+
+  int Control(uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, uint8_t *data, size_t len);
 private:
   struct Async{
     Endpoint ep;
@@ -81,10 +85,10 @@ private:
 };
 
 NakedUsb* NakedUsb::Create(){
-  return new Iusb;
+  return new NakedUsbImpl;
 }
 
-bool Iusb::GetDevicePath(LPGUID interface_guid, LPTSTR device_path, size_t buf_len)
+bool NakedUsbImpl::GetDevicePath(LPGUID interface_guid, LPTSTR device_path, size_t buf_len)
 {
   HDEVINFO device_info;
   SP_DEVICE_INTERFACE_DATA interface_data;
@@ -94,7 +98,7 @@ bool Iusb::GetDevicePath(LPGUID interface_guid, LPTSTR device_path, size_t buf_l
   if (SUCCEEDED(SetupDiEnumDeviceInterfaces(device_info, NULL, interface_guid, 0, &interface_data)))
   {
     ULONG required_length = 0;
-    if (SUCCEEDED(SetupDiGetDeviceInterfaceDetail(device_info, &interface_data, NULL, 0, &required_length, NULL))&&required_length)
+    if (SUCCEEDED(SetupDiGetDeviceInterfaceDetail(device_info, &interface_data, NULL, 0, &required_length, NULL)) && required_length)
     {
       auto detail_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA)LocalAlloc(LMEM_FIXED, required_length);
       detail_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
@@ -116,14 +120,14 @@ bool Iusb::GetDevicePath(LPGUID interface_guid, LPTSTR device_path, size_t buf_l
   return false;
 }
 
-Iusb::Iusb()
+NakedUsbImpl::NakedUsbImpl()
   :device_handle_(nullptr)
   , win_usb_handle_(nullptr)
 {
 
 }
 
-bool Iusb::Open(LPGUID interface_guid)
+bool NakedUsbImpl::Open(LPGUID interface_guid)
 {
   char device_path[_MAX_PATH + 1];
 
@@ -151,6 +155,17 @@ bool Iusb::Open(LPGUID interface_guid)
         ep.input = (pipe_info.PipeId & 0x80) ? true : false;
         ep.interval = pipe_info.Interval;
         ep.max_size = pipe_info.MaximumPacketSize;
+
+        if (USB_ENDPOINT_DIRECTION_IN(pipe_info.PipeId))
+        {
+          BOOL tr = TRUE;
+          WinUsb_SetPipePolicy(win_usb_handle_, pipe_info.PipeId, AUTO_CLEAR_STALL, 4, &tr);
+          WinUsb_SetPipePolicy(win_usb_handle_, pipe_info.PipeId, RESET_PIPE_ON_RESUME, 4, &tr);
+          WinUsb_SetPipePolicy(win_usb_handle_, pipe_info.PipeId, AUTO_FLUSH, 4, &tr);
+          ULONG to = 1500;
+          WinUsb_SetPipePolicy(win_usb_handle_, pipe_info.PipeId, PIPE_TRANSFER_TIMEOUT, 4, &to);
+        }
+
         if (UsbdPipeTypeInterrupt == pipe_info.PipeType){
           ep.type = EndpointType::Interrupt;
         }
@@ -166,7 +181,7 @@ bool Iusb::Open(LPGUID interface_guid)
   return false;
 }
 
-void Iusb::Close()
+void NakedUsbImpl::Close()
 {
   device_handle_ && CloseHandle(device_handle_);
   win_usb_handle_ && WinUsb_Free(win_usb_handle_);
@@ -178,12 +193,12 @@ void Iusb::Close()
   }
 }
 
-Iusb::~Iusb()
+NakedUsbImpl::~NakedUsbImpl()
 {
   Close();
 }
 
-bool Iusb::onEasyRead(std::function<void(uint8_t *buf, size_t len)> cb){
+bool NakedUsbImpl::onEasyRead(std::function<void(uint8_t *buf, size_t len)> cb){
   for (auto e : ends_){
     if (e.input){
       volatile bool wait = true;
@@ -193,7 +208,7 @@ bool Iusb::onEasyRead(std::function<void(uint8_t *buf, size_t len)> cb){
       a.reads = 0;
       a.exit = false;
       a.sem = new semaphore();
-      a.thread = new std::thread([this,e,&wait](){
+      a.thread = new std::thread([this, e, &wait](){
         while (wait)std::this_thread::sleep_for(std::chrono::microseconds(1));
         for (auto &a : event_){
           if (a.ep.address == e.address){
@@ -220,7 +235,7 @@ bool Iusb::onEasyRead(std::function<void(uint8_t *buf, size_t len)> cb){
   return false;
 }
 
-void Iusb::Poll(){
+void NakedUsbImpl::Poll(){
   for (auto &a : event_){
     std::vector<std::vector<uint8_t> > buf;
     a.sem->lock();
@@ -228,8 +243,38 @@ void Iusb::Poll(){
     a.buf.clear();
     a.sem->unlock();
     for (auto b : buf){
-      a.cb(&*b.begin(), b.size());
+      if (0 < b.size())
+        a.cb(&*b.begin(), b.size());
     }
   }
 }
 
+int NakedUsbImpl::ReadSync(const Endpoint *ep, uint8_t *buf, int len)
+{
+  int bytes_read;
+  WinUsb_ReadPipe(win_usb_handle_, ep->address, buf, len, (PULONG)&bytes_read, NULL);
+  return bytes_read;
+}
+
+void NakedUsbImpl::WriteSync(const Endpoint *ep, const uint8_t *buf, int len)
+{
+  int bytes;
+  WinUsb_WritePipe(win_usb_handle_, ep->address, const_cast<PUCHAR>(buf), len, (PULONG)&bytes, NULL);
+  WinUsb_FlushPipe(win_usb_handle_, ep->address);
+}
+
+int NakedUsbImpl::Control(uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, uint8_t *data, size_t len)
+{
+  WINUSB_SETUP_PACKET p;
+  p.RequestType = request_type;
+  p.Request = request;
+  p.Value = value;
+  p.Index = index;
+  p.Length = len;
+  ULONG transfered = 0;
+  WinUsb_ControlTransfer(win_usb_handle_, p, data, len, &transfered, NULL);
+  if (len != transfered){
+    return -1;
+  }
+  return transfered;
+}

@@ -27,6 +27,10 @@ public:
   virtual bool onEasyRead(std::function<void(uint8_t *buf, size_t len)> cb) = 0;
   virtual void Poll() = 0;
 
+  virtual int ReadSync(const Endpoint *ep,uint8_t *buf, int len) = 0;
+  virtual void WriteSync(const Endpoint *ep, const uint8_t *buf, int len) = 0;
+
+  virtual int Control(uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, uint8_t *data, size_t len) = 0;
   static NakedUsb* Create();
 };
 

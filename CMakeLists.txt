@@ -8,20 +8,22 @@ if(CMAKE_COMPILER_IS_GNUCC)
     add_definitions(-DGCC)
 endif()
 
-add_subdirectory(libuv)
-
 include_directories(.
 libuv/include
+zlib/include
 )
+
+
+add_subdirectory(libuv)
+add_subdirectory(zlib)
+add_subdirectory(drivers)
 
 add_executable(deepiot
   http-parser/http_parser.c
   http-parser/http_parser.h
-  drivers/usb/iusb.cpp
-  drivers/usb/iusb.h
-  drivers/tenkey.cpp
-  drivers/tenkey.h
+  png/png.cc
+  png/png.h
   main.cc
 )
 
-target_link_libraries(deepiot libuv)
+target_link_libraries(deepiot libuv zlib tenkey webcam sdr rokujiku osemb)
